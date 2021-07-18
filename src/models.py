@@ -8,6 +8,10 @@ from torch import nn
 import utils
 
 
+# Convert tensors on the cpu/gpu to numpy
+def to_np(tensor):
+  return tensor.detach().cpu().numpy()
+
 class ZDataset:
   def __init__(self, x, y, block_size):
     # x = np.arange(28*28*2).reshape((-1, 28, 28))
@@ -42,13 +46,12 @@ class VisionTransformer(nn.Module):
     
     self.device = device
     
-    self.vision_embedder = nn.Sequential(
-        nn.Linear(block_size*block_size, config['d_model']),
-    )
+    self.vision_embedder = nn.Linear(
+      block_size*block_size, config['d_model']//2)
     
     self.num_embeddings = int(28*28/(block_size*block_size)) + 1
     self.position_embedder = nn.Embedding(
-      self.num_embeddings, config['d_model'])
+      self.num_embeddings, config['d_model']//2)
     
     transformer_layer = nn.TransformerEncoderLayer(
       config['d_model'], config['nhead'], config['dim_feedforward'],
@@ -56,9 +59,7 @@ class VisionTransformer(nn.Module):
     self.transformer = nn.TransformerEncoder(
       transformer_layer, config['num_layers'], norm=None)
     
-    self.last_linear = nn.Sequential(
-        nn.Linear(config['d_model'], 10),
-    )
+    self.last_linear = nn.Linear(config['d_model'], 10)
 
   def forward(self, d):
     B = d['x'].shape[0]
@@ -67,11 +68,28 @@ class VisionTransformer(nn.Module):
       torch.arange(self.num_embeddings, device=self.device)).reshape((
         self.num_embeddings, 1, -1))).repeat(1, B, 1)
     transformed = self.transformer(torch.cat(
-      [embedded_vision, pos_embedding]))
+      [embedded_vision, pos_embedding], -1))
     output = self.last_linear(transformed[0])
+    
+    # if np.random.uniform() < 1e-3:
+    #   a = to_np(pos_embedding); b = to_np(transformed[0])
+    #   import pdb; pdb.set_trace()
     
     return output
 
+def convert_d_types(d, device):
+  for k in d.keys():
+    d[k] = d[k].to(device).float()
+    if k in ['y']:
+      d[k] = d[k].to(device).long()
+    else:
+      d[k] = d[k].to(device).float()
+      
+def summarize_preds(all_preds, all_y):
+  preds = np.concatenate(all_preds)
+  y = np.concatenate(all_y)
+  
+  return utils.mean_cross_entropy_logits(preds, y)
 
 class Model():
   def __init__(self, config, train_x, train_y, test_x, test_y):
@@ -80,8 +98,6 @@ class Model():
     self.train_y = train_y
     self.test_x = test_x
     self.test_y = test_y
-    
-    self.fit()
 
   def fit(self):
     self.nn = VisionTransformer(
@@ -89,7 +105,6 @@ class Model():
       self.config['device'])
     self.nn.to(self.config['device'])
 
-    # Train phase
     record_time = str(datetime.datetime.now())[:19]
     model_save_path = self.config['model_folder'] / (record_time + '.pt')
 
@@ -99,19 +114,20 @@ class Model():
       num_workers=self.config['n_workers'],
       shuffle=True,
       pin_memory=True)
-    
    
     test_loader = torch.utils.data.DataLoader(
       ZDataset(self.test_x, self.test_y, self.config['block_size']),
       batch_size=self.config['batch_size'],
       num_workers=self.config['n_workers'],
-      shuffle=True,
+      shuffle=False,
       pin_memory=True)
     
     optimizer_f = lambda par: torch.optim.Adam(par, lr=self.config['lr'])
     optimizer = optimizer_f(self.nn.parameters())
     if self.config.get('scheduler', None) is not None:
       self.scheduler = self.config.get('scheduler')(optimizer)
+      
+    # Train phase
     met_hist = []
     best_test = float('inf')
     for epoch in range(self.config['n_epochs']):
@@ -121,59 +137,42 @@ class Model():
       avg_train_loss = 0
       all_preds = []
       all_y = []
- 
       for batch_id, d in enumerate(train_loader):
         # print(f"Batch id: {batch_id}")
         optimizer.zero_grad()
  
-        for k in d.keys():
-          d[k] = d[k].to(self.config['device']).float()
-          if k in ['y']:
-            d[k] = d[k].to(self.config['device']).long()
-          else:
-            d[k] = d[k].to(self.config['device']).float()
+        convert_d_types(d, self.config['device'])
         preds = self.nn(d)
-        all_preds.append(preds.detach().cpu().numpy())
+        all_preds.append(to_np(preds))
         batch_y = d['y']
-        all_y.append(batch_y.cpu().numpy())
+        all_y.append(to_np(batch_y))
    
         loss = nn.CrossEntropyLoss()(preds, batch_y)
-        avg_train_loss += loss.detach().cpu() / len(train_loader)
+        avg_train_loss += to_np(loss) / len(train_loader)
    
         if epoch > 0:
           loss.backward()
         optimizer.step()
 
       self.nn.eval()
-      train_preds = np.concatenate(all_preds)
-      train_y = np.concatenate(all_y)
-      train_loss, train_acc = utils.mean_cross_entropy_logits(
-        train_preds, train_y)
+      train_loss, train_acc = summarize_preds(all_preds, all_y)
   
       if self.config.get('scheduler', None) is not None:
         self.scheduler.step()
  
       train_elapsed = time.time() - start_time
 
+      # Test phase
       all_preds = []
       all_y = []
       for batch_id, d in enumerate(test_loader):
-        # import pdb; pdb.set_trace()
-        # print(batch_id)
-        for k in d.keys():
-          if k in ['y']:
-            d[k] = d[k].to(self.config['device']).long()
-          else:
-            d[k] = d[k].to(self.config['device']).float()
-        preds = self.nn(d).detach().cpu().numpy()
-        all_preds.append(preds)
-        batch_y = d['y']
-        all_y.append(batch_y.cpu().numpy())
+        # print(f"Batch id: {batch_id}")
+        
+        convert_d_types(d, self.config['device'])
+        all_preds.append(to_np(self.nn(d)))
+        all_y.append(to_np(d['y']))
 
-      test_preds = np.concatenate(all_preds)
-      test_y = np.concatenate(all_y)
-      test_loss, test_acc = utils.mean_cross_entropy_logits(test_preds, test_y)
-      
+      test_loss, test_acc = summarize_preds(all_preds, all_y)
       met_hist.append(test_loss)
       if test_loss < best_test:
         best_test = test_loss
@@ -183,6 +182,6 @@ class Model():
             _use_new_zipfile_serialization=False)
       elapsed = time.time() - start_time
       
-      print(f"{epoch:3}: {train_loss:8.4f} {test_loss:8.4f}\
+      print(f"{epoch+1:3}: {train_loss:8.2f} {test_loss:8.2f}\
 {train_acc:8.2f} {test_acc:8.2f} {train_elapsed:8.2f}s {elapsed:8.2f}s")
 
