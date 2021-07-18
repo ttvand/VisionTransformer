@@ -11,7 +11,7 @@ config = {
     'batch_size': 32,
     'block_size': 4,
     'n_epochs': 50,
-    'lr': 2e-4,
+    'lr': 2e-4, # Don't set this too high to avoid getting stuck!
     'scheduler': [lambda optimizer: torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=20, eta_min=1e-7), None][1],
     'model_folder': pathlib.Path(__file__).parent.absolute().parent / 'Models',

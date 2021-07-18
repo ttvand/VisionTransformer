@@ -1,5 +1,6 @@
 import datetime
 import numpy as np
+import pathlib
 from skimage.util import view_as_blocks
 import time
 import torch
@@ -7,10 +8,6 @@ from torch import nn
 
 import utils
 
-
-# Convert tensors on the cpu/gpu to numpy
-def to_np(tensor):
-  return tensor.detach().cpu().numpy()
 
 class ZDataset:
   def __init__(self, x, y, block_size):
@@ -72,24 +69,11 @@ class VisionTransformer(nn.Module):
     output = self.last_linear(transformed[0])
     
     # if np.random.uniform() < 1e-3:
-    #   a = to_np(pos_embedding); b = to_np(transformed[0])
+    #   a = utils.to_np(pos_embedding); b = utils.to_np(transformed[0])
     #   import pdb; pdb.set_trace()
     
     return output
 
-def convert_d_types(d, device):
-  for k in d.keys():
-    d[k] = d[k].to(device).float()
-    if k in ['y']:
-      d[k] = d[k].to(device).long()
-    else:
-      d[k] = d[k].to(device).float()
-      
-def summarize_preds(all_preds, all_y):
-  preds = np.concatenate(all_preds)
-  y = np.concatenate(all_y)
-  
-  return utils.mean_cross_entropy_logits(preds, y)
 
 class Model():
   def __init__(self, config, train_x, train_y, test_x, test_y):
@@ -107,6 +91,10 @@ class Model():
 
     record_time = str(datetime.datetime.now())[:19]
     model_save_path = self.config['model_folder'] / (record_time + '.pt')
+    image_folder = self.config['model_folder'].parent / 'Images'
+    pathlib.Path(self.config['model_folder']).mkdir(
+      parents=True, exist_ok=True)
+    pathlib.Path(image_folder).mkdir(parents=True, exist_ok=True)
 
     train_loader = torch.utils.data.DataLoader(
       ZDataset(self.train_x, self.train_y, self.config['block_size']),
@@ -141,21 +129,21 @@ class Model():
         # print(f"Batch id: {batch_id}")
         optimizer.zero_grad()
  
-        convert_d_types(d, self.config['device'])
+        utils.convert_d_types(d, self.config['device'])
         preds = self.nn(d)
-        all_preds.append(to_np(preds))
+        all_preds.append(utils.to_np(preds))
         batch_y = d['y']
-        all_y.append(to_np(batch_y))
+        all_y.append(utils.to_np(batch_y))
    
         loss = nn.CrossEntropyLoss()(preds, batch_y)
-        avg_train_loss += to_np(loss) / len(train_loader)
+        avg_train_loss += utils.to_np(loss) / len(train_loader)
    
         if epoch > 0:
           loss.backward()
         optimizer.step()
 
       self.nn.eval()
-      train_loss, train_acc = summarize_preds(all_preds, all_y)
+      train_loss, train_acc, _ = utils.summarize_preds(all_preds, all_y)
   
       if self.config.get('scheduler', None) is not None:
         self.scheduler.step()
@@ -168,11 +156,13 @@ class Model():
       for batch_id, d in enumerate(test_loader):
         # print(f"Batch id: {batch_id}")
         
-        convert_d_types(d, self.config['device'])
-        all_preds.append(to_np(self.nn(d)))
-        all_y.append(to_np(d['y']))
+        utils.convert_d_types(d, self.config['device'])
+        all_preds.append(utils.to_np(self.nn(d)))
+        all_y.append(utils.to_np(d['y']))
 
-      test_loss, test_acc = summarize_preds(all_preds, all_y)
+      test_loss, test_acc, y_pred = utils.summarize_preds(all_preds, all_y)
+      utils.store_confusion_matrix(
+        self.test_x, self.test_y, y_pred, epoch+1, image_folder)
       met_hist.append(test_loss)
       if test_loss < best_test:
         best_test = test_loss
